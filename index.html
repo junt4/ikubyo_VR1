@@ -1,0 +1,992 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>育苗ハウス 1号棟 VR — 潅水シミュレーター</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=M+PLUS+Rounded+1c:wght@500;700;800&display=swap" rel="stylesheet">
+<style>
+:root{
+  --panel:rgba(255,251,238,.95); --edge:#e6d6b0; --ink:#5a4535; --ink-soft:#8c7560;
+  --leaf:#7cc45f; --leaf-deep:#4d9a3b; --water-deep:#2c85c2;
+  --font:"M PLUS Rounded 1c","Hiragino Maru Gothic ProN","Hiragino Sans","Yu Gothic",system-ui,sans-serif;
+  box-sizing:border-box;
+  padding-top:env(safe-area-inset-top,0px); padding-bottom:env(safe-area-inset-bottom,0px);
+}
+@media (prefers-color-scheme:dark){ :root:not([data-theme="light"]){ --panel:rgba(56,49,42,.94); --edge:#6b5c4a; --ink:#f5ebd7; --ink-soft:#cdbb9f; } }
+:root[data-theme="dark"]{ --panel:rgba(56,49,42,.94); --edge:#6b5c4a; --ink:#f5ebd7; --ink-soft:#cdbb9f; }
+html{height:100%;scroll-padding-top:env(safe-area-inset-top,0px)}
+html,body{margin:0;overflow:hidden;background:#9fd6f2;font-family:var(--font);color:var(--ink);-webkit-user-select:none;user-select:none}
+body{height:100%}
+*,*::before,*::after{box-sizing:border-box}
+#stage{position:fixed;inset:0}
+#stage canvas{display:block;cursor:crosshair;touch-action:none}
+#gate{position:fixed;left:50%;bottom:calc(16px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);z-index:5;
+  width:min(560px,calc(100% - 24px));background:var(--panel);border:3px solid var(--edge);border-radius:22px;padding:12px 14px;
+  display:grid;grid-template-columns:auto 1fr;gap:12px;align-items:center;box-shadow:0 4px 0 rgba(150,118,72,.25),0 10px 22px rgba(60,40,20,.16)}
+#vrBtn{font-family:inherit;font-weight:800;font-size:18px;border:0;border-radius:16px;padding:14px 18px;background:var(--leaf);color:#fff;cursor:pointer;
+  box-shadow:inset 0 -4px 0 rgba(0,0,0,.14)}
+#vrBtn:disabled{background:#c9c0ad;cursor:not-allowed}
+#vrBtn:focus-visible{outline:3px solid var(--water-deep);outline-offset:2px}
+#gateMsg{font-size:13px;font-weight:700;line-height:1.5;color:var(--ink-soft)}
+#keys{position:fixed;left:12px;top:calc(12px + env(safe-area-inset-top,0px));z-index:5;font-size:12px;font-weight:700;color:#3d5a6b;
+  background:rgba(255,255,255,.55);border-radius:10px;padding:5px 9px;max-width:calc(100% - 24px)}
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<div id="keys">PCプレビュー：左ドラッグで散水／右ドラッグ・矢印で視点／WASDで移動／1・2・3ノズル／V水分ビュー／F速さ／E設定</div>
+<div id="gate"><button id="vrBtn" disabled>🥽 VRで遊ぶ</button><div id="gateMsg">VR対応を確認しています…</div></div>
+
+<script src="three.min.js" onerror="this.remove()"></script>
+<script>if(!window.THREE)document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"><\/script>');</script>
+<script>
+(function(){
+'use strict';
+if(!window.THREE){document.body.innerHTML='<p style="padding:2em;font-family:sans-serif">3Dライブラリを読み込めませんでした。ページを再読み込みしてください。</p>';return;}
+const $=s=>document.querySelector(s);
+const clamp=(v,a,b)=>v<a?a:v>b?b:v;
+const lerp=(a,b,t)=>a+(b-a)*t;
+const rand=(a,b)=>a+Math.random()*(b-a);
+
+/* ================= 定数 ================= */
+const CELL=0.3,NX=10,NZ=6,LANES=2,BPL=4,GAP=0.22,BENCH_Y=0.78;
+const BL=NX*CELL,BW=NZ*CELL,NB=LANES*BPL,PER=NX*NZ,N=NB*PER;
+const LANE_Z=[-1.62,1.62];
+const SOIL_TOP=BENCH_Y+0.105;
+const DAYS=20,PHASE2_DAY=7;   // 仕様書：本葉展開期はDay7〜
+const GH={x:8.4,z:3.6,eave:2.3,ridge:3.7};
+const REACH=5.4;
+const GR=1.25/(DAYS*540);
+/* 給水モデル（仕様書 §7 準拠）
+   rate[0-100/秒] = L/min × FLOW_CONST ÷ 半径²(格子単位)。本作の含水量は0〜1なので÷100。
+   格子1単位 = 0.124m として、フラット半径5 → 0.62m に対応させる。 */
+const FLOW_CONST=8.265625,GRID_M=0.124,FALLOFF_K=0.2,SOAK_T=0.1,SOAK_DELAY=3,SOAK_DRY=0.10;
+const TOOLS={
+  big:{name:'ビッグ',gr:6,min:40,max:70,def:70,color:0xbfe9ff,pps:1100,spread:.85,ico:'💦',msg:'💦 ビッグ：いちばん広い。境界ではにじみに注意'},
+  flat:{name:'フラット',gr:5,min:20,max:35,def:30,color:0xffffff,pps:900,spread:.85,ico:'🚿',msg:'🚿 フラット：広さと水量のバランス型'},
+  straight:{name:'ストレート',gr:2,min:5,max:20,def:6,color:0xffe27a,pps:420,spread:.7,ico:'💧',msg:'💧 ストレート：狭く、端や境界の仕上げ用'}
+};
+const TOOL_ORDER=['big','flat','straight'];
+for(const k in TOOLS)TOOLS[k].r=TOOLS[k].gr*GRID_M;
+const LPM={};for(const k in TOOLS)LPM[k]=TOOLS[k].def;
+try{const sv=JSON.parse(localStorage.getItem('ikubyo_lpm')||'{}');for(const k in sv)if(TOOLS[k])LPM[k]=clamp(+sv[k],TOOLS[k].min,TOOLS[k].max);}catch(e){}
+const toolRate=k=>LPM[k]*FLOW_CONST/(TOOLS[k].gr*TOOLS[k].gr)/100;
+const BANDS=[
+  {name:'発芽期',low:.35,high:.85,wilt:.14},
+  {name:'本葉期',low:.45,high:.72,wilt:.25}
+];
+/* ---- 時間システム（仕様書 §5） ----
+   8:00〜17:00 を1本の連続した時計で進める。実時間30秒 = ゲーム内1時間。 */
+const DAY_START=480,DAY_END=1020,HOUR_SEC=30,GMIN_PER_SEC=60/HOUR_SEC;
+const SPEEDS=[{m:1,sym:'▷',name:'通常'},{m:15,sym:'→',name:'早送り'},{m:40,sym:'→→',name:'もっと早送り'}];
+const LUNCH_MIN_SPEED=15;           // 昼休憩は操作不可・自動経過（最低でも×15で進める）
+const SEGS=[
+  {from:480,to:540,label:'朝の潅水',kind:'water'},
+  {from:540,to:720,label:'朝の続き',kind:'free'},
+  {from:720,to:780,label:'昼休憩',kind:'lunch'},
+  {from:780,to:840,label:'昼の潅水',kind:'water'},
+  {from:840,to:960,label:'午後の管理',kind:'free'},
+  {from:960,to:1020,label:'夕方の潅水',kind:'water'}
+];
+const segAt=c=>SEGS.find(g=>c>=g.from&&c<g.to)||SEGS[SEGS.length-1];
+/* ---- 蒸散（仕様書 §4） ---- */
+const HOUR_MULT=[.35,.47,.76,1.10,1.32,1.32,1.10,.76,.47];   // 8〜16時
+const SHADE_MULT=.35;
+const EVAP_BASE=[.10,.20];          // 含水量(0-100)/秒・等倍時
+const NIGHT_DECAY=[5,10];           // 夜間の固定減衰(0-100)
+const SKY_MULT={open:1.25,close:.82};
+const WX_EVAP={sun:1,cloud:.8,rain:.6};   // 本作独自：天気による補正
+const DEATH_MIN=240;                // 含水量0が4時間続くと枯死
+const START=new Date(2026,8,1);
+const WD='日月火水木金土';
+const WX={sun:{icon:'☀️',name:'晴れ',f:1,t:2},cloud:{icon:'⛅',name:'くもり',f:.6,t:0},rain:{icon:'🌧️',name:'雨',f:.35,t:-2}};
+
+/* ================= セルデータ ================= */
+const M=new Float32Array(N),G=new Float32Array(N),DRY=new Float32Array(N),ROT=new Float32Array(N),
+      STR=new Float32Array(N),BURN=new Float32Array(N),VAR=new Float32Array(N),IB=new Float32Array(N),RY=new Float32Array(N),
+      PX=new Float32Array(N),PZ=new Float32Array(N);
+const DW=new Float32Array(N),LOCK=new Float32Array(N),SCHK=new Uint8Array(N);
+const DM=new Float32Array(N),ZT=new Float32Array(N);
+const EDGE=new Uint8Array(N),BEN=new Uint8Array(N),WLT=new Uint8Array(N),OVR=new Uint8Array(N),DRYT=new Uint8Array(N);
+const benches=[];
+for(let l=0;l<LANES;l++)for(let i=0;i<BPL;i++)benches.push({x:(i-(BPL-1)/2)*(BL+GAP),z:LANE_Z[l],label:'AB'[l]+'-'+(i+1)});
+{let k=0;for(let b=0;b<NB;b++){const B=benches[b];for(let cz=0;cz<NZ;cz++)for(let cx=0;cx<NX;cx++){
+  PX[k]=B.x-BL/2+CELL*(cx+.5);PZ[k]=B.z-BW/2+CELL*(cz+.5);
+  EDGE[k]=(cx===0||cx===NX-1||cz===0||cz===NZ-1)?1:0;BEN[k]=b;
+  // 位置による乾きやすさ（仕様書 §4-3）：レーン内で隣のベンチに面する辺＝通路、それ以外の辺＝外周
+  const bi=b%BPL,gapAdj=(cx===0&&bi>0)||(cx===NX-1&&bi<BPL-1);
+  const outer=(cx===0&&bi===0)+(cx===NX-1&&bi===BPL-1)+(cz===0)+(cz===NZ-1);
+  const second=(cx===1&&bi===0)||(cx===NX-2&&bi===BPL-1)||cz===1||cz===NZ-2;
+  DM[k]=gapAdj?.8:outer>=2?1.6:outer===1?1.35:second?1.1:1;
+  k++;}}}
+
+const S={};
+function resetGame(){
+  for(let i=0;i<N;i++){M[i]=rand(.5,.62);G[i]=0;DRY[i]=0;ROT[i]=0;STR[i]=0;BURN[i]=0;VAR[i]=1;ZT[i]=0;IB[i]=0;RY[i]=rand(0,Math.PI*2);WLT[i]=0;OVR[i]=0;DRYT[i]=0;}
+  Object.assign(S,{day:1,clock:DAY_START,paused:true,running:false,tool:'flat',vent:false,skyOpen:true,shadeFrom:690,shadeTo:780,spd:0,wateredToday:false,warnT:0,
+    checkedTemp:false,view:false,pressing:false,aimOn:false,menuOpen:false,dayMin:0,maxT:0,hotNoShade:0,history:[],weather:[]});
+  for(let d=0;d<=DAYS+1;d++){const r=Math.random();S.weather[d]=d<=1?'sun':r<.5?'sun':r<.85?'cloud':'rain';}
+}
+resetGame();
+
+const curBand=()=>BANDS[S.day>=PHASE2_DAY?1:0];
+const phaseIdx=()=>S.day>=PHASE2_DAY?1:0;
+const shadeOn=h=>{const m=h*60;return m>=S.shadeFrom&&m<S.shadeTo;};
+function hourMult(h){
+  if(shadeOn(h)||h>=17)return SHADE_MULT;
+  const x=clamp(h-8.5,0,8),i=Math.floor(x),f=x-i;return lerp(HOUR_MULT[i],HOUR_MULT[Math.min(8,i+1)],f);
+}
+const fmtT=m=>Math.floor(m/60)+':'+String(Math.round(m%60)).padStart(2,'0');
+function solar(h){if(h<6.2||h>18.8)return 0;return Math.pow(Math.sin(Math.PI*(h-6.2)/12.6),1.15)*WX[S.weather[S.day]].f;}
+function tempAt(h){const s=solar(h);return 12+WX[S.weather[S.day]].t+19*s*(shadeOn(h)?.68:1)-5*(S.skyOpen?1:0)*s-(S.vent?2.2:0);}
+
+/* ================= シミュレーション ================= */
+function simStep(dt,clockMin){
+  const h=(clockMin/60)%24,s=solar(h),T=tempAt(h),band=curBand(),sh=shadeOn(h);
+  // 実効蒸散 = フェーズ基準 × 時間帯倍率 × 位置倍率 × 天窓倍率（×天気補正）
+  // EVAP_BASE は「0-100/実秒(等倍)」→ 本作の0-1・ゲーム内1分あたりへ換算
+  const loss=EVAP_BASE[phaseIdx()]/100/GMIN_PER_SEC*hourMult(h)*(S.skyOpen?SKY_MULT.open:SKY_MULT.close)*WX_EVAP[S.weather[S.day]];
+  const isDay=h>=8&&h<17;
+  const gr=isDay?GR*(sh?.88:1)*dt:0;
+  const p2=S.day>=PHASE2_DAY;
+  if(isDay){S.dayMin+=dt;if(T>S.maxT)S.maxT=T;if(T>30&&!sh)S.hotNoShade+=dt;}
+  for(let i=0;i<N;i++){
+    if(DRY[i]>=1||ROT[i]>=1)continue;             // 枯死マスは含水量も固定
+    let m=M[i]-loss*DM[i]*dt;if(m<0)m=0;M[i]=m;
+    if(m<=0){ZT[i]+=dt;if(ZT[i]>=DEATH_MIN){DRY[i]=1;continue;}}else ZT[i]=0;
+    if(m<band.wilt){DRY[i]+=.0032*dt*(1+(band.wilt-m)*5);WLT[i]=1;}
+    if(m>=band.low){
+      if(m<=band.high){G[i]+=gr;if(isDay)IB[i]+=dt;}
+      else{
+        G[i]+=gr*.9;OVR[i]=1;
+        if(p2)STR[i]+=(m-band.high)*.014*dt*(S.vent?.6:1)*(sh?1.25:1);
+        else{STR[i]+=(m-band.high)*.004*dt;if(m>.95)ROT[i]+=(m-.95)*.05*dt*(S.vent?.6:1);}
+      }
+    }else{
+      G[i]+=gr*.75*clamp((m-band.wilt)/(band.low-band.wilt),0,1);DRYT[i]=1;
+      if(isDay&&T>30&&s>.45&&!sh)BURN[i]+=.0028*dt*(T-30)/4*(p2?1:.5);
+    }
+  }
+}
+function simulate(total,from){const st=2;for(let t=0;t<total;t+=st){const d=Math.min(st,total-t);simStep(d,from+t+d/2);}}
+
+/* ================= three.js（VR対応） ================= */
+const EYE=1.7;                       // PCプレビュー時の目線。VRでは実際の頭の高さ
+const renderer=new THREE.WebGLRenderer({antialias:true});
+renderer.setPixelRatio(Math.min(window.devicePixelRatio||1,2));
+renderer.setSize(innerWidth,innerHeight);
+renderer.shadowMap.enabled=true;renderer.shadowMap.type=THREE.PCFSoftShadowMap;
+renderer.xr.enabled=true;
+renderer.xr.setReferenceSpaceType('local-floor');
+if(renderer.xr.setFoveation)renderer.xr.setFoveation(1);   // Quest：視野の周辺を粗く描いて負荷を下げる
+$('#stage').appendChild(renderer.domElement);
+const scene=new THREE.Scene();
+scene.background=new THREE.Color('#9fd6f2');
+scene.fog=new THREE.Fog('#9fd6f2',28,90);
+/* rig = プレイヤーの立ち位置。VRでは頭とコントローラーがこの子になり、スティック移動・スナップ回転はrigを動かす */
+const rig=new THREE.Group();scene.add(rig);
+const camera=new THREE.PerspectiveCamera(70,innerWidth/innerHeight,.05,200);
+camera.rotation.order='YXZ';camera.position.set(0,EYE,0);
+rig.add(camera);
+const hemi=new THREE.HemisphereLight(0xe6f6ff,0xb9a78a,.78);scene.add(hemi);
+const sun=new THREE.DirectionalLight(0xfff1d6,.8);
+sun.castShadow=true;sun.shadow.mapSize.set(1024,1024);
+Object.assign(sun.shadow.camera,{left:-12,right:12,top:12,bottom:-12,near:1,far:60});
+sun.shadow.bias=-.0006;scene.add(sun);scene.add(sun.target);
+
+const mat=(c,o)=>new THREE.MeshStandardMaterial(Object.assign({color:c,roughness:.85,metalness:0,flatShading:true},o||{}));
+const V3=(x,y,z)=>new THREE.Vector3(x,y,z);
+function add(geo,m,x,y,z,opt){const me=new THREE.Mesh(geo,m);me.position.set(x,y,z);if(opt&&opt.cast)me.castShadow=true;if(!opt||opt.recv!==false)me.receiveShadow=true;scene.add(me);return me;}
+function beam(a,b,r,m,seg){const d=new THREE.Vector3().subVectors(b,a),len=d.length();const me=new THREE.Mesh(new THREE.CylinderGeometry(r,r,len,seg||6),m);me.position.copy(a).addScaledVector(d,.5);me.quaternion.setFromUnitVectors(V3(0,1,0),d.normalize());me.castShadow=true;scene.add(me);return me;}
+
+/* --- 外の景色 --- */
+add(new THREE.PlaneGeometry(240,240).rotateX(-Math.PI/2),mat('#a9d673'),0,-.02,0);
+for(let i=0;i<9;i++){const a=i/9*Math.PI*2+rand(-.2,.2),r=rand(55,75);
+  const h=add(new THREE.IcosahedronGeometry(rand(10,18),1),mat(['#8cc865','#7dbb5a','#9ad172'][i%3]),Math.cos(a)*r,-3,Math.sin(a)*r);h.scale.y=.45;}
+function tree(x,z){const s=rand(.8,1.4);add(new THREE.CylinderGeometry(.14*s,.2*s,1.2*s,5),mat('#9a6b45'),x,.6*s,z,{cast:true});
+  const c=['#5fae4e','#6fbd52','#4f9e48'][Math.floor(Math.random()*3)];
+  if(Math.random()<.5){add(new THREE.ConeGeometry(1.1*s,1.8*s,6),mat(c),x,1.9*s,z,{cast:true});add(new THREE.ConeGeometry(.8*s,1.4*s,6),mat(c),x,2.7*s,z,{cast:true});}
+  else add(new THREE.IcosahedronGeometry(1.1*s,0),mat(c),x,2.1*s,z,{cast:true});}
+for(let i=0;i<46;i++){let x,z;do{x=rand(-40,40);z=rand(-30,30);}while(Math.abs(x)<12&&Math.abs(z)<8);tree(x,z);}
+const clouds=[];for(let i=0;i<10;i++){const g=new THREE.Group();for(let j=0;j<3;j++){const m=new THREE.Mesh(new THREE.IcosahedronGeometry(rand(1.5,2.6),0),mat('#ffffff',{roughness:1}));m.position.set(j*2-2,rand(-.3,.3),rand(-.6,.6));m.scale.y=.6;g.add(m);}g.position.set(rand(-60,60),rand(16,24),rand(-50,50));scene.add(g);clouds.push(g);}
+
+/* --- ハウス --- */
+add(new THREE.PlaneGeometry(GH.x*2,GH.z*2).rotateX(-Math.PI/2),mat('#d8d0c0'),0,0,0);
+for(const z of LANE_Z)add(new THREE.PlaneGeometry(GH.x*2-.6,BW+.9).rotateX(-Math.PI/2),mat('#77736b'),0,.005,z);
+const frameM=mat('#eef2f6',{roughness:.5});
+const prof=[];for(let k=0;k<=10;k++){const t=k/10*Math.PI;prof.push([-GH.z*Math.cos(t),GH.eave+(GH.ridge-GH.eave)*Math.sin(t)]);}
+for(let x=-GH.x;x<=GH.x+.01;x+=2.1){
+  beam(V3(x,0,-GH.z),V3(x,GH.eave,-GH.z),.045,frameM);beam(V3(x,0,GH.z),V3(x,GH.eave,GH.z),.045,frameM);
+  for(let k=0;k<10;k++)beam(V3(x,prof[k][1],prof[k][0]),V3(x,prof[k+1][1],prof[k+1][0]),.04,frameM);
+  beam(V3(x,GH.eave,-GH.z),V3(x,GH.eave,GH.z),.025,frameM);
+}
+for(const k of[0,3,5,7,10])beam(V3(-GH.x,prof[k][1],prof[k][0]),V3(GH.x,prof[k][1],prof[k][0]),.03,frameM);
+for(const z of[-GH.z,GH.z])beam(V3(-GH.x,1.1,z),V3(GH.x,1.1,z),.03,frameM);
+const glass=new THREE.MeshStandardMaterial({color:0xffffff,transparent:true,opacity:.13,side:THREE.DoubleSide,depthWrite:false,roughness:.2});
+{const pos=[],idx=[];prof.forEach((p,k)=>{pos.push(-GH.x,p[1],p[0],GH.x,p[1],p[0]);if(k<10){const a=k*2;idx.push(a,a+1,a+3,a,a+3,a+2);}});
+ const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));g.setIndex(idx);g.computeVertexNormals();scene.add(new THREE.Mesh(g,glass));}
+for(const z of[-GH.z,GH.z]){const m=new THREE.Mesh(new THREE.PlaneGeometry(GH.x*2,GH.eave),glass);m.position.set(0,GH.eave/2,z);scene.add(m);}
+{const sh=new THREE.Shape();sh.moveTo(-GH.z,0);prof.forEach(p=>sh.lineTo(p[0],p[1]));sh.lineTo(GH.z,0);
+ for(const x of[-GH.x,GH.x]){const m=new THREE.Mesh(new THREE.ShapeGeometry(sh).rotateY(Math.PI/2),glass);m.position.x=x;scene.add(m);}}
+// 天窓
+const skyPanels=[];
+for(const side of[1,-1]){const g=new THREE.Group();g.position.set(0,GH.ridge+.03,0);
+  const p=new THREE.Mesh(new THREE.BoxGeometry(GH.x*2-.4,.025,.85).translate(0,0,side*.425),new THREE.MeshStandardMaterial({color:0xdff3ff,transparent:true,opacity:.45,roughness:.2}));
+  g.add(p);scene.add(g);skyPanels.push({g,side,cur:0});}
+// 遮光カーテン
+const curtain=new THREE.Mesh(new THREE.PlaneGeometry(GH.x*2,GH.z*2-.1).rotateX(Math.PI/2).translate(GH.x,0,0),
+  new THREE.MeshStandardMaterial({color:0xf6f1e2,transparent:true,opacity:.62,side:THREE.DoubleSide,depthWrite:false,roughness:1}));
+curtain.position.set(-GH.x,GH.eave-.06,0);curtain.scale.x=.02;scene.add(curtain);
+// 換気扇
+const fans=[];
+for(const z of[-1.8,1.8]){add(new THREE.BoxGeometry(.14,1,1),mat('#cfd7df',{roughness:.5}),GH.x-.08,1.75,z,{cast:true});
+  const g=new THREE.Group();g.position.set(GH.x-.18,1.75,z);
+  for(let k=0;k<4;k++){const b=new THREE.Mesh(new THREE.BoxGeometry(.03,.4,.12).translate(0,.2,0),mat('#8fa1b3'));b.rotation.x=k*Math.PI/2;g.add(b);}
+  g.add(new THREE.Mesh(new THREE.CylinderGeometry(.07,.07,.06,8).rotateZ(Math.PI/2),mat('#6d7d8c')));scene.add(g);fans.push(g);}
+
+/* --- ベンチ --- */
+const benchM=mat('#9aa6b4',{roughness:.6}),legM=mat('#b6c0cb',{roughness:.5}),trayM=mat('#2d2d33',{roughness:.9});
+function label(text){const c=document.createElement('canvas');c.width=128;c.height=64;const x=c.getContext('2d');
+  x.fillStyle='#fffbee';x.beginPath();x.moveTo(12,4);x.arcTo(124,4,124,60,12);x.arcTo(124,60,4,60,12);x.arcTo(4,60,4,4,12);x.arcTo(4,4,124,4,12);x.fill();
+  x.fillStyle='#5a4535';x.font='bold 36px sans-serif';x.textAlign='center';x.textBaseline='middle';x.fillText(text,64,34);
+  const sp=new THREE.Sprite(new THREE.SpriteMaterial({map:new THREE.CanvasTexture(c),depthWrite:false}));sp.scale.set(.42,.21,1);return sp;}
+benches.forEach(B=>{
+  add(new THREE.BoxGeometry(BL+.14,.035,BW+.14),benchM,B.x,BENCH_Y,B.z,{cast:true});
+  add(new THREE.BoxGeometry(BL+.04,.08,BW+.04),trayM,B.x,BENCH_Y+.06,B.z);
+  for(const sx of[-1,0,1])for(const sz of[-1,1])add(new THREE.BoxGeometry(.05,BENCH_Y,.05),legM,B.x+sx*(BL/2-.05),BENCH_Y/2,B.z+sz*(BW/2-.02),{cast:true});
+  // 札は通路から見てベンチの奥側（外周側）の縁に立てる
+  const far=(B.z<0?B.z-BW/2:B.z+BW/2)+Math.sign(B.z)*.045;
+  add(new THREE.BoxGeometry(.02,.2,.05),mat('#ffffff'),B.x-BL/2+.14,SOIL_TOP+.08,far);
+  const sp=label(B.label);sp.position.set(B.x-BL/2+.14,SOIL_TOP+.32,far);scene.add(sp);
+});
+
+/* --- 土(セル) --- */
+const dummy=new THREE.Object3D(),tmpC=new THREE.Color(),ZERO=new THREE.Matrix4().makeScale(0,0,0);
+const soilLit=mat(0xffffff,{roughness:.95});
+const soilFlat=new THREE.MeshBasicMaterial({color:0xffffff});   // 水分ビュー用：光・影・遮光の影響を受けない
+const soil=new THREE.InstancedMesh(new THREE.BoxGeometry(CELL*.86,.03,CELL*.86),soilLit,N);
+soil.receiveShadow=true;
+for(let i=0;i<N;i++){dummy.position.set(PX[i],SOIL_TOP-.015,PZ[i]);dummy.updateMatrix();soil.setMatrixAt(i,dummy.matrix);soil.setColorAt(i,tmpC.set(0x7b5a44));}
+scene.add(soil);
+/* --- 苗 --- */
+function merge(list){const pos=[];list.forEach(g=>{const n=g.index?g.toNonIndexed():g;pos.push(...n.attributes.position.array);});
+  const o=new THREE.BufferGeometry();o.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));o.computeVertexNormals();return o;}
+const cotGeo=merge([
+  new THREE.CylinderGeometry(.006,.009,.09,4).translate(0,.045,0),
+  new THREE.OctahedronGeometry(1,0).scale(.055,.008,.028).rotateZ(.3).translate(.05,.095,0),
+  new THREE.OctahedronGeometry(1,0).scale(.055,.008,.028).rotateZ(-.3).translate(-.05,.095,0)]);
+const truList=[new THREE.CylinderGeometry(.007,.01,.14,4).translate(0,.07,0)];
+for(let k=0;k<4;k++)truList.push(new THREE.OctahedronGeometry(1,0).scale(.07,.009,.04).rotateZ(.28).translate(.07,.13+(k%2)*.02,0).rotateY(k*Math.PI/2+Math.PI/4));
+const truGeo=merge(truList);
+const plantM=mat(0xffffff,{roughness:.75});
+const cot=new THREE.InstancedMesh(cotGeo,plantM,N),tru=new THREE.InstancedMesh(truGeo,plantM,N);
+for(const im of[cot,tru]){for(let i=0;i<N;i++){im.setMatrixAt(i,ZERO);im.setColorAt(i,tmpC.set(0x6fb84f));}im.receiveShadow=true;scene.add(im);}
+const cBurn=new THREE.Color('#a8733c'),cDead=new THREE.Color('#8c7a5c');
+function updatePlants(){
+  const band=curBand(),p2=S.day>=PHASE2_DAY;
+  for(let i=0;i<N;i++){
+    const g=G[i];
+    if(g<.04||S.view){cot.setMatrixAt(i,ZERO);tru.setMatrixAt(i,ZERO);continue;}
+    const alive=DRY[i]<1&&ROT[i]<1;
+    const sc=.35+.9*Math.min(g,1.15),str=Math.min(STR[i],1.5),w=1-Math.min(str,1)*.28,hg=1+str*.85;
+    const droop=alive?clamp((band.low-M[i])/(band.low-band.wilt),0,1):1;
+    dummy.position.set(PX[i],SOIL_TOP,PZ[i]);dummy.rotation.set(alive?0:.5,RY[i],0);
+    dummy.scale.set(sc*w,sc*hg*(1-droop*.4)*(alive?1:.5),sc*w);dummy.updateMatrix();cot.setMatrixAt(i,dummy.matrix);
+    tmpC.setHSL(.29-.1*droop,.6-.22*Math.min(str,1)-.1*droop,.42+.1*Math.min(str,1)+.06*droop);
+    if(BURN[i]>0)tmpC.lerp(cBurn,Math.min(BURN[i],1)*.7);
+    if(!alive)tmpC.copy(cDead);
+    cot.setColorAt(i,tmpC);
+    if(p2&&alive){const tl=clamp((g-.3)/.6,.12,1.1);
+      dummy.rotation.set(0,RY[i],0);dummy.scale.set(sc*tl*w,sc*tl*hg*(1-droop*.45),sc*tl*w);dummy.updateMatrix();
+      tru.setMatrixAt(i,dummy.matrix);tmpC.offsetHSL(0,.02,-.05);tru.setColorAt(i,tmpC);}
+    else tru.setMatrixAt(i,ZERO);
+  }
+  cot.instanceMatrix.needsUpdate=tru.instanceMatrix.needsUpdate=true;
+  cot.instanceColor.needsUpdate=tru.instanceColor.needsUpdate=true;
+}
+
+/* --- 土の色 (塗り絵レイヤー) --- */
+const SC={dry:new THREE.Color('#e3b891'),dryHi:new THREE.Color('#a98567'),okLo:new THREE.Color('#8a6b58'),okHi:new THREE.Color('#4a5b8c'),
+  ovLo:new THREE.Color('#3f7fb0'),ovHi:new THREE.Color('#86d8f5'),
+  vDry:new THREE.Color('#d7332a'),vDryHi:new THREE.Color('#f5b83d'),vOkLo:new THREE.Color('#7fe07a'),vOkHi:new THREE.Color('#239a4a'),vOvLo:new THREE.Color('#3a8ee6'),vOvHi:new THREE.Color('#2a2f9e')};
+function soilColor(m,b,out){
+  const v=S.view;
+  if(m<b.wilt)return out.copy(v?SC.vDry:SC.dry);
+  if(m<b.low)return out.copy(v?SC.vDry:SC.dry).lerp(v?SC.vDryHi:SC.dryHi,(m-b.wilt)/(b.low-b.wilt));
+  if(m<=b.high)return out.copy(v?SC.vOkLo:SC.okLo).lerp(v?SC.vOkHi:SC.okHi,(m-b.low)/(b.high-b.low));
+  return out.copy(v?SC.vOvLo:SC.ovLo).lerp(v?SC.vOvHi:SC.ovHi,clamp((m-b.high)/(1.12-b.high),0,1));
+}
+const cDeadSoil=new THREE.Color(28/255,22/255,20/255);
+function updateSoil(){const b=curBand();for(let i=0;i<N;i++){
+  if(S.view&&(DRY[i]>=1||ROT[i]>=1))soil.setColorAt(i,cDeadSoil);else soil.setColorAt(i,soilColor(M[i],b,tmpC));}
+  soil.instanceColor.needsUpdate=true;}
+
+/* 水分ビューの切替：無照明マテリアルに差し替え、タイルを少し大きく持ち上げて塗り絵のマス目のように見せる */
+function applyViewMode(){
+  soil.material=S.view?soilFlat:soilLit;
+  const sc=S.view?1.1:1,y=S.view?SOIL_TOP+.03:SOIL_TOP-.015;
+  for(let i=0;i<N;i++){dummy.position.set(PX[i],y,PZ[i]);dummy.rotation.set(0,0,0);dummy.scale.set(sc,1,sc);dummy.updateMatrix();soil.setMatrixAt(i,dummy.matrix);}
+  soil.instanceMatrix.needsUpdate=true;
+  updatePlants();
+}
+/* --- ブラシリング --- */
+const ring=new THREE.Mesh(new THREE.RingGeometry(.9,1,40).rotateX(-Math.PI/2),new THREE.MeshBasicMaterial({color:0xffffff,transparent:true,opacity:.85,depthTest:false}));
+ring.renderOrder=10;scene.add(ring);
+const ringDot=new THREE.Mesh(new THREE.CircleGeometry(.03,12).rotateX(-Math.PI/2),new THREE.MeshBasicMaterial({color:0xffffff,depthTest:false}));
+ringDot.renderOrder=10;scene.add(ringDot);
+
+/* --- 着地ガイド（放物線）--- */
+const ARC_N=28,arcPos=new Float32Array(ARC_N*3);
+const arcGeo=new THREE.BufferGeometry();arcGeo.setAttribute('position',new THREE.BufferAttribute(arcPos,3));
+const arcLine=new THREE.Line(arcGeo,new THREE.LineBasicMaterial({color:0xffffff,transparent:true,opacity:.45,depthWrite:false}));
+arcLine.frustumCulled=false;arcLine.visible=false;scene.add(arcLine);
+
+/* --- ノズル（潅水ワンド）：-Z方向に水が出る。VRでは右手のグリップ、PCではカメラに付ける --- */
+const metal=mat('#c8ced6',{roughness:.35,metalness:.3});
+const faceM=new THREE.MeshStandardMaterial({color:0xffffff,roughness:.45,flatShading:true});
+const nozzle=new THREE.Group();
+{const Y=.045;
+ nozzle.add(new THREE.Mesh(new THREE.CylinderGeometry(.011,.011,.42,8).rotateX(-Math.PI/2).translate(0,Y,-.24),metal));
+ nozzle.add(new THREE.Mesh(new THREE.CylinderGeometry(.05,.018,.07,12).rotateX(-Math.PI/2).translate(0,Y,-.475),metal));
+ nozzle.add(new THREE.Mesh(new THREE.CylinderGeometry(.047,.047,.01,12).rotateX(-Math.PI/2).translate(0,Y,-.512),faceM));
+ const valve=new THREE.Mesh(new THREE.BoxGeometry(.034,.034,.07),mat('#6fb36b'));valve.position.set(0,Y,-.01);nozzle.add(valve);
+ const grip=new THREE.Mesh(new THREE.BoxGeometry(.036,.11,.046),mat('#6fb36b'));grip.position.set(0,-.012,.01);grip.rotation.x=-.25;nozzle.add(grip);
+ const hand=new THREE.Mesh(new THREE.IcosahedronGeometry(.052,0),mat('#f2b08a'));hand.scale.set(1,.95,1.3);hand.position.set(.006,-.018,.012);nozzle.add(hand);
+ nozzle.add(new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3([V3(0,Y,.02),V3(0,Y-.02,.12),V3(.03,-.3,.18),V3(.06,-.9,.08)]),12,.02,5),mat('#4f8f5a')));}
+const tip=new THREE.Object3D();tip.position.set(0,.045,-.52);nozzle.add(tip);
+/* PC用ホルダー：lookAtで+Zが狙いを向くので、中身を180°回してノズルの-Zを狙いに合わせる */
+const deskHolder=new THREE.Group();deskHolder.position.set(.24,-.27,-.32);camera.add(deskHolder);
+const deskInner=new THREE.Group();deskInner.rotation.y=Math.PI;deskInner.scale.setScalar(.8);deskHolder.add(deskInner);
+deskInner.add(nozzle);
+/* 左手：コントローラー本体の簡易モデル */
+const leftBody=new THREE.Mesh(new THREE.BoxGeometry(.04,.03,.11),mat('#3b3f46',{roughness:.6}));leftBody.position.set(0,-.01,.02);
+
+/* --- 水しぶき --- */
+const PN=1100,pPos=new Float32Array(PN*3),PS=new Float32Array(PN*3),PE=new Float32Array(PN*3),PT=new Float32Array(PN).fill(1),PV=new Float32Array(PN),PA=new Float32Array(PN);
+for(let i=0;i<PN;i++)pPos[i*3+1]=-50;
+const pGeo=new THREE.BufferGeometry();pGeo.setAttribute('position',new THREE.BufferAttribute(pPos,3));
+const drops=new THREE.Points(pGeo,new THREE.PointsMaterial({color:0xcfefff,size:.03,transparent:true,opacity:.85,depthWrite:false}));
+drops.frustumCulled=false;scene.add(drops);
+let pCur=0,emitAcc=0;const tipW=new THREE.Vector3();
+/* hit.T があれば実際の飛行時間（VRの放物線）に合わせて弧を描く。放物線の弦からの膨らみ = gT²/8 */
+function emit(hit,dt){
+  const t=TOOLS[S.tool];tip.getWorldPosition(tipW);
+  emitAcc+=t.pps*(LPM[S.tool]/t.def)*dt;
+  while(emitAcc>=1){emitAcc--;const i=pCur;pCur=(pCur+1)%PN;
+    const a=Math.random()*Math.PI*2,r=Math.sqrt(Math.random())*t.r*t.spread;
+    PS[i*3]=tipW.x;PS[i*3+1]=tipW.y;PS[i*3+2]=tipW.z;
+    PE[i*3]=hit.pt.x+Math.cos(a)*r;PE[i*3+1]=SOIL_TOP+.02;PE[i*3+2]=hit.pt.z+Math.sin(a)*r;
+    PT[i]=0;
+    if(hit.T){const T=hit.T*rand(.93,1.07);PV[i]=1/T;PA[i]=9.8*T*T/8;}
+    else{const d=tipW.distanceTo(hit.pt);PV[i]=1/(.18+d*.07)*rand(.9,1.1);PA[i]=d*(S.tool==='straight'?.06:.12);}}
+}
+function updateDrops(dt){
+  for(let i=0;i<PN;i++){if(PT[i]>=1)continue;let t=PT[i]+dt*PV[i];if(t>=1){PT[i]=1;pPos[i*3+1]=-50;continue;}PT[i]=t;
+    pPos[i*3]=lerp(PS[i*3],PE[i*3],t);pPos[i*3+1]=lerp(PS[i*3+1],PE[i*3+1],t)+PA[i]*4*t*(1-t);pPos[i*3+2]=lerp(PS[i*3+2],PE[i*3+2],t);}
+  pGeo.attributes.position.needsUpdate=true;
+}
+
+/* ================= 照準（VR：ノズルからの放物線／PC：マウス）================= */
+const ray=new THREE.Raycaster(),plane=new THREE.Plane(V3(0,1,0),-SOIL_TOP),hitV=new THREE.Vector3();
+const headW=new THREE.Vector3(),dirW=new THREE.Vector3(),tmpV=new THREE.Vector3(),fwd=new THREE.Vector3(),tmpQ=new THREE.Quaternion();
+const SPD={big:5.6,flat:6.2,straight:7.4};   // 吐出の初速(m/s)。狭いノズルほど遠くへ飛ぶ
+const GRAV=9.8;
+const inHouse=(x,z)=>Math.abs(x)<GH.x-.1&&Math.abs(z)<GH.z-.1;
+function mkHit(x,z,lim,extra){
+  hitV.set(x,SOIL_TOP,z);camera.getWorldPosition(headW);
+  const dist=Math.hypot(x-headW.x,z-headW.z);
+  return Object.assign({pt:hitV,dist,ok:inHouse(x,z)&&dist<=lim,spill:S.tool!=='straight'&&benchesInCircle(x,z,TOOLS[S.tool].r)>1,cell:cellAt(x,z)},extra||{});
+}
+function pickVR(){
+  tip.updateMatrixWorld(true);tip.getWorldPosition(tipW);
+  tip.getWorldDirection(dirW).negate();                 // ノズルの-Zが吐出方向
+  const v=SPD[S.tool],vx=dirW.x*v,vy=dirW.y*v,vz=dirW.z*v,dy=tipW.y-SOIL_TOP;
+  const disc=vy*vy+2*GRAV*dy;if(disc<0)return null;
+  const T=(vy+Math.sqrt(disc))/GRAV;if(!(T>0))return null;
+  for(let k=0;k<ARC_N;k++){const t=T*k/(ARC_N-1);arcPos[k*3]=tipW.x+vx*t;arcPos[k*3+1]=tipW.y+vy*t-GRAV*t*t/2;arcPos[k*3+2]=tipW.z+vz*t;}
+  arcGeo.attributes.position.needsUpdate=true;
+  return mkHit(tipW.x+vx*T,tipW.z+vz*T,REACH+1.4,{T});
+}
+const mouse=new THREE.Vector2();
+function pickDesk(){
+  if(!hasMouse)return null;
+  camera.updateMatrixWorld();ray.setFromCamera(mouse,camera);
+  if(!ray.ray.intersectPlane(plane,hitV))return null;
+  camera.getWorldPosition(headW);
+  if(Math.hypot(hitV.x-headW.x,hitV.z-headW.z)>14)return null;
+  return mkHit(hitV.x,hitV.z,REACH);
+}
+function benchesInCircle(x,z,r){let c=0;for(const B of benches){const qx=clamp(x,B.x-BL/2,B.x+BL/2),qz=clamp(z,B.z-BW/2,B.z+BW/2);if((qx-x)**2+(qz-z)**2<r*r)c++;}return c;}
+function cellAt(x,z){for(let b=0;b<NB;b++){const B=benches[b];if(Math.abs(x-B.x)<BL/2&&Math.abs(z-B.z)<BW/2){
+  const cx=Math.floor((x-(B.x-BL/2))/CELL),cz=Math.floor((z-(B.z-BW/2))/CELL);return b*PER+clamp(cz,0,NZ-1)*NX+clamp(cx,0,NX-1);}}return -1;}
+let wClock=0;   // 実時間(秒)。soak遅延の判定に使う
+function applyWater(pt,dt){
+  const t=TOOLS[S.tool],r=t.r,r2=r*r,rate=toolRate(S.tool);wClock+=dt;
+  for(let i=0;i<N;i++){
+    const dx=PX[i]-pt.x,dz=PZ[i]-pt.z,d2=dx*dx+dz*dz;
+    if(d2>=r2){DW[i]=0;SCHK[i]=0;continue;}
+    if(DRY[i]>=1||ROT[i]>=1){continue;}             // 枯死・腐敗株は反応しない
+    DW[i]+=dt;
+    let soak;
+    if(DW[i]<=SOAK_T)soak=.2;                        // 素早い一撫では0.2倍
+    else{
+      if(!SCHK[i]){SCHK[i]=1;if(M[i]<SOAK_DRY)LOCK[i]=wClock+SOAK_DELAY;}  // 過乾燥は3秒間しみ込みにくい
+      soak=wClock<LOCK[i]?.5:1;
+    }
+    const fall=1-FALLOFF_K*Math.sqrt(d2)/r;
+    M[i]=Math.min(1.12,M[i]+rate*fall*soak*dt);
+  }
+}
+function stopWater(){DW.fill(0);SCHK.fill(0);}
+/* ================= 環境の見た目・光 ================= */
+const skyCols={sun:new THREE.Color('#9fd6f2'),cloud:new THREE.Color('#bccbd6'),rain:new THREE.Color('#9fadb9')},eveC=new THREE.Color('#f5c79a');
+function updateWorld(dt){
+  curtain.scale.x=lerp(curtain.scale.x,shadeOn(S.clock/60)?1:.02,Math.min(1,dt*2.5));
+  if(S.vent)fans.forEach(f=>f.rotation.x+=dt*14);
+  skyPanels.forEach(p=>{p.cur=lerp(p.cur,S.skyOpen?1:0,Math.min(1,dt*2));p.g.rotation.x=p.side*(.1-.62*p.cur);});
+  clouds.forEach(c=>{c.position.x+=dt*.6;if(c.position.x>70)c.position.x=-70;});
+  const h=S.clock/60,s=solar(h),a=(h-6)/13*Math.PI;
+  sun.position.set(Math.cos(a)*14,2+Math.sin(a)*14,-6);sun.target.position.set(0,0,0);
+  sun.intensity=(.25+.75*s)*(shadeOn(h)?.72:1);hemi.intensity=.62+.25*WX[S.weather[S.day]].f;
+  const col=skyCols[S.weather[S.day]].clone();if(h>15.5)col.lerp(eveC,clamp((h-15.5)/1.5,0,1)*.45);
+  scene.background.lerp(col,Math.min(1,dt*2));scene.fog.color.copy(scene.background);
+}
+
+/* ================= 3Dパネル UI（VRでもPCでも同じ仕組み） =================
+   キャンバスに描いた板をワールドに置き、コントローラーの光線（PCはマウス）で押す */
+const FONT='"M PLUS Rounded 1c","Hiragino Maru Gothic ProN","Hiragino Sans","Yu Gothic","Noto Sans CJK JP",sans-serif';
+const COL={panel:'rgba(255,251,238,.97)',panel2:'#f5ead0',edge:'#e6d6b0',ink:'#5a4535',soft:'#8c7560',leaf:'#7cc45f',leafD:'#4d9a3b',
+  water:'#4fb3e8',waterD:'#2c85c2',sun:'#f3b63a',warn:'#e8735a'};
+const panels=[];
+const seen=new Set();let fontPending=false;
+function noteChars(s){let add=false;for(const ch of s)if(!seen.has(ch)){seen.add(ch);add=true;}
+  if(add&&!fontPending&&document.fonts&&document.fonts.load){fontPending=true;
+    setTimeout(()=>{const t=[...seen].join('');
+      Promise.all(['700','800'].map(w=>document.fonts.load(`${w} 32px "M PLUS Rounded 1c"`,t))).then(()=>{fontPending=false;panels.forEach(p=>p.redraw());}).catch(()=>{fontPending=false;});},60);}}
+function rr(x,a,b,w,h,r){r=Math.min(r,w/2,h/2);x.beginPath();x.moveTo(a+r,b);x.arcTo(a+w,b,a+w,b+h,r);x.arcTo(a+w,b+h,a,b+h,r);x.arcTo(a,b+h,a,b,r);x.arcTo(a,b,a+w,b,r);x.closePath();}
+function setFont(x,size,w){x.font=`${w||700} ${size}px ${FONT}`;}
+function txt(x,s,px,py,o){o=o||{};s=String(s);noteChars(s);setFont(x,o.size||30,o.w);x.fillStyle=o.c||COL.ink;x.textAlign=o.a||'left';x.textBaseline=o.b||'alphabetic';
+  if(o.max){let sz=o.size||30;while(sz>14&&x.measureText(s).width>o.max){sz-=2;setFont(x,sz,o.w);}}
+  x.fillText(s,px,py);}
+function lines(x,s,maxW,size,w){noteChars(s);setFont(x,size,w);const out=[];let line='';
+  for(const ch of s){if(ch==='\n'){out.push(line);line='';continue;}const t=line+ch;if(line&&x.measureText(t).width>maxW){out.push(line);line=ch;}else line=t;}
+  if(line)out.push(line);return out;}
+function para(x,s,px,py,maxW,size,lh,o){o=o||{};const ls=lines(x,s,maxW,size,o.w);x.fillStyle=o.c||COL.ink;x.textAlign='left';x.textBaseline='alphabetic';
+  ls.forEach((l,i)=>x.fillText(l,px,py+i*lh));return py+ls.length*lh;}
+function frame(x,W,H){x.clearRect(0,0,W,H);x.fillStyle=COL.panel;rr(x,6,6,W-12,H-12,56);x.fill();x.lineWidth=8;x.strokeStyle=COL.edge;x.stroke();}
+
+class Panel{
+  constructor(W,H,widthM,opt){opt=opt||{};
+    this.W=W;this.H=H;this.c=document.createElement('canvas');this.c.width=W;this.c.height=H;this.x=this.c.getContext('2d');
+    this.tex=new THREE.CanvasTexture(this.c);this.tex.anisotropy=4;
+    this.mesh=new THREE.Mesh(new THREE.PlaneGeometry(widthM,widthM*H/W),
+      new THREE.MeshBasicMaterial({map:this.tex,transparent:true,depthTest:!opt.top,depthWrite:false,side:THREE.DoubleSide}));
+    this.mesh.renderOrder=opt.top?20:6;this.mesh.userData.panel=this;
+    this.btns=[];this.hover=null;this.draw=null;this.primaryFn=null;panels.push(this);}
+  redraw(){if(!this.draw)return;this.btns=[];this.primaryFn=null;this.draw(this.x,this);this.tex.needsUpdate=true;}
+  at(uv){const px=uv.x*this.W,py=(1-uv.y)*this.H;return this.btns.find(b=>px>=b.x&&px<=b.x+b.w&&py>=b.y&&py<=b.y+b.h)||null;}
+  button(key,a,b,w,h,label,fn,o){o=o||{};const x=this.x,hov=this.hover===key&&!o.dis;
+    const bg=o.dis?'#e7e1d3':o.primary?(hov?'#93d877':COL.leaf):o.on?(hov?'#72c6f0':COL.water):(hov?'#fff4d6':COL.panel2);
+    x.fillStyle='rgba(150,118,72,.25)';rr(x,a,b+6,w,h,h*.3);x.fill();
+    x.fillStyle=bg;rr(x,a,b,w,h,h*.3);x.fill();
+    if(hov){x.lineWidth=6;x.strokeStyle=COL.waterD;rr(x,a,b,w,h,h*.3);x.stroke();}
+    txt(x,label,a+w/2,b+h/2+2,{size:o.size||Math.round(h*.44),w:800,c:o.dis?'#b3a78f':(o.primary||o.on)?'#fff':COL.ink,a:'center',b:'middle',max:w-24});
+    if(!o.dis){this.btns.push({key,x:a,y:b,w,h,fn});if(o.primary)this.primaryFn=fn;}}
+  seg(key,a,b,w,h,opts,cur,fn,dis){const bw=w/opts.length;
+    opts.forEach((op,i)=>this.button(key+i,a+i*bw+(i?4:0),b,bw-(i<opts.length-1?4:0)-(i?4:0),h,op[1],()=>fn(op[0]),{on:cur===op[0],dis,size:Math.round(h*.42)}));}
+}
+
+/* --- 各パネル --- */
+const modal=new Panel(1600,1000,1.5,{top:true});modal.mesh.visible=false;
+const wrist=new Panel(720,440,.22);
+const toastP=new Panel(1000,120,.62,{top:true});toastP.mesh.visible=false;camera.add(toastP.mesh);toastP.mesh.position.set(0,-.3,-1.1);
+const gauge=new Panel(600,176,.3,{top:true});gauge.mesh.visible=false;scene.add(gauge.mesh);
+
+/* 光線の当たり先カーソル（VR） */
+const laser=new THREE.Line(new THREE.BufferGeometry().setFromPoints([V3(0,0,0),V3(0,0,-1)]),new THREE.LineBasicMaterial({color:0x2c85c2,depthTest:false,transparent:true}));
+laser.renderOrder=30;laser.visible=false;
+const cursor=new THREE.Mesh(new THREE.CircleGeometry(.009,16),new THREE.MeshBasicMaterial({color:0x2c85c2,depthTest:false,transparent:true}));
+cursor.renderOrder=31;cursor.visible=false;scene.add(cursor);
+
+/* --- トースト --- */
+let toastUntil=0;
+function toast(msg){
+  toastP.draw=(x)=>{x.clearRect(0,0,1000,120);x.fillStyle=COL.panel;rr(x,5,5,990,110,48);x.fill();x.lineWidth=6;x.strokeStyle=COL.edge;x.stroke();
+    txt(x,msg,500,62,{size:38,w:800,a:'center',b:'middle',max:930});};
+  toastP.redraw();toastP.mesh.visible=true;toastUntil=performance.now()+2800;}
+
+/* --- 手首HUD --- */
+const pad2=n=>String(Math.floor(n)).padStart(2,'0');
+const clockStr=m=>Math.floor(m/60)+':'+pad2(m%60);
+const pct=v=>Math.round(v*100);
+wrist.draw=(x,p)=>{
+  x.clearRect(0,0,720,440);x.fillStyle=COL.panel;rr(x,5,5,710,430,44);x.fill();x.lineWidth=6;x.strokeStyle=COL.edge;x.stroke();
+  const g=segAt(S.clock),band=curBand(),c=todoCounts(),T=tempAt(S.clock/60),wx=WX[S.weather[S.day]];
+  x.fillStyle=COL.leaf;rr(x,24,22,112,96,26);x.fill();
+  txt(x,S.day,80,80,{size:54,w:800,c:'#fff',a:'center'});txt(x,'日目',80,108,{size:20,w:800,c:'#fff',a:'center'});
+  txt(x,clockStr(S.clock),156,88,{size:64,w:800});
+  txt(x,wx.icon,356,86,{size:46});
+  txt(x,dateStr(),430,60,{size:28,w:700,c:COL.soft});
+  txt(x,g.label+(g.kind==='lunch'?'（自動で進行）':S.spd>0?'（早送り中）':''),430,102,{size:30,w:800,c:g.kind==='water'?COL.waterD:COL.ink,max:270});
+  const L=24,W=672,tl=m=>L+W*(m-DAY_START)/(DAY_END-DAY_START);
+  x.fillStyle='#efe4c8';rr(x,L,136,W,28,14);x.fill();
+  x.save();rr(x,L,136,W,28,14);x.clip();
+  SEGS.forEach(s=>{if(s.kind==='free')return;x.fillStyle=s.kind==='water'?'#a9dcf5':'#e9c9a0';x.fillRect(tl(s.from),136,tl(s.to)-tl(s.from),28);});
+  x.fillStyle='rgba(90,69,53,.14)';x.fillRect(L,136,tl(S.clock)-L,28);x.restore();
+  if(S.shadeTo>S.shadeFrom){x.fillStyle='rgba(90,69,53,.45)';rr(x,tl(S.shadeFrom),126,tl(S.shadeTo)-tl(S.shadeFrom),7,3);x.fill();}
+  x.fillStyle=COL.ink;rr(x,tl(S.clock)-4,124,8,52,4);x.fill();
+  const box=(bx,label,val,col)=>{x.fillStyle=COL.panel2;rr(x,bx,188,212,86,20);x.fill();
+    txt(x,label,bx+16,218,{size:22,w:800,c:COL.soft});txt(x,val,bx+196,262,{size:40,w:800,c:col||COL.ink,a:'right'});};
+  box(24,'適正水分',c.wp+'%',COL.waterD);box(254,'苗の健康',c.hp+'%',COL.leafD);box(484,'気温',T.toFixed(0)+'℃',T>30?COL.warn:COL.ink);
+  txt(x,`${band.name}　適正 ${pct(band.low)}〜${pct(band.high)}%`,26,314,{size:26,w:800});
+  txt(x,`${TOOLS[S.tool].ico} ${TOOLS[S.tool].name} ${LPM[S.tool]}L/min`,694,314,{size:26,w:800,c:COL.soft,a:'right'});
+  const by=338,bh=78,bw=156;
+  p.button('menu',24,by,bw,bh,'⚙️ 設定',()=>S.menuOpen?closeMenu():openMenu(),{on:S.menuOpen,size:28});
+  p.button('spd',24+bw+16,by,bw,bh,`${SPEEDS[S.spd].sym} ×${SPEEDS[S.spd].m}`,cycleSpeed,{on:S.spd>0,size:28});
+  p.button('view',24+(bw+16)*2,by,bw,bh,S.view?'🎨 水分':'🌱 通常',toggleView,{on:S.view,size:28});
+  p.button('tool',24+(bw+16)*3,by,bw,bh,`${TOOLS[S.tool].ico} 切替`,toggleTool,{size:28});
+};
+
+/* --- 着地点の水分ゲージ（ビルボード） --- */
+let gaugeKey='';
+function updateGauge(hit){
+  if(!hit||!S.running||S.paused||hit.cell<0){gauge.mesh.visible=false;return;}
+  const b=curBand(),m=M[hit.cell],pc=v=>clamp(v/1.12,0,1);
+  const state=m<b.wilt?'乾燥（萎れ）':m<b.low?'やや乾燥':m<=b.high?'適正':m>1?'水たまり':'過湿';
+  const warn=!hit.ok?'遠すぎて届きません':hit.spill?'境界：隣のベンチににじみます':'';
+  const key=`${BEN[hit.cell]}|${pct(m)}|${state}|${warn}|${b.name}`;
+  if(key!==gaugeKey){gaugeKey=key;
+    gauge.draw=(x)=>{x.clearRect(0,0,600,176);x.fillStyle=COL.panel;rr(x,4,4,592,168,36);x.fill();x.lineWidth=5;x.strokeStyle=COL.edge;x.stroke();
+      txt(x,`${benches[BEN[hit.cell]].label}　水分 ${pct(m)}%　${state}`,28,58,{size:34,w:800,max:548,c:state==='適正'?COL.leafD:COL.ink});
+      x.fillStyle='#e9dfc6';rr(x,28,82,544,26,13);x.fill();
+      x.fillStyle='rgba(124,196,95,.75)';x.fillRect(28+544*pc(b.low),82,544*(pc(b.high)-pc(b.low)),26);
+      x.fillStyle=COL.ink;rr(x,28+544*pc(m)-5,74,10,42,5);x.fill();
+      if(warn)txt(x,warn,28,150,{size:28,w:800,c:COL.warn});};
+    gauge.redraw();}
+  gauge.mesh.visible=true;
+  gauge.mesh.position.set(hit.pt.x,SOIL_TOP+.34,hit.pt.z);
+  camera.getWorldQuaternion(gauge.mesh.quaternion);
+  gauge.mesh.scale.setScalar(clamp(hit.dist/2.2,.8,2));
+}
+
+/* --- モーダル（開始・設定・日報・結果） --- */
+let modalMode=null,needPlace=0;
+function placeModal(){
+  if(!xrOn){camera.add(modal.mesh);
+    const hf=2*Math.atan(Math.tan(camera.fov*Math.PI/360)*camera.aspect),vf=camera.fov*Math.PI/180;
+    const d=Math.max(1.0,.8/Math.tan(hf/2),.5/Math.tan(vf/2));modal.mesh.position.set(0,0,-d);modal.mesh.rotation.set(0,0,0);return;}
+  scene.add(modal.mesh);camera.getWorldPosition(headW);camera.getWorldDirection(fwd);fwd.y=0;
+  if(fwd.lengthSq()<1e-4)fwd.set(0,0,-1);fwd.normalize();
+  modal.mesh.position.copy(headW).addScaledVector(fwd,1.3);modal.mesh.position.y=headW.y-.12;
+  modal.mesh.lookAt(headW.x,modal.mesh.position.y,headW.z);
+}
+function showModal(mode,draw){modalMode=mode;modal.draw=draw;modal.hover=null;modal.redraw();modal.mesh.visible=true;placeModal();}
+function hideModal(){modalMode=null;modal.mesh.visible=false;}
+
+/* ================= 状態の操作 ================= */
+function setTool(t){S.tool=t;ring.scale.setScalar(TOOLS[t].r);faceM.color.set(TOOLS[t].color);wrist.redraw();}
+function toggleTool(){setTool(TOOL_ORDER[(TOOL_ORDER.indexOf(S.tool)+1)%3]);toast(TOOLS[S.tool].msg+`（${LPM[S.tool]} L/min）`);}
+function toggleView(){S.view=!S.view;applyViewMode();wrist.redraw();if(S.menuOpen)modal.redraw();toast(S.view?'🎨 水分ビュー：苗を隠して水分だけ表示':'🌱 通常ビュー');}
+function setSpeed(i,msg){S.spd=i;wrist.redraw();if(S.menuOpen)modal.redraw();if(msg)toast(msg);}
+function cycleSpeed(){const i=(S.spd+1)%SPEEDS.length,sp=SPEEDS[i];setSpeed(i,i===0?'▷ 通常の速さ：潅水できます':`${sp.sym} ${sp.name}（×${sp.m}）：潅水はできません`);}
+function dateStr(){const d=new Date(START);d.setDate(d.getDate()+S.day-1);return`${d.getMonth()+1}/${d.getDate()} (${WD[d.getDay()]})`;}
+function todoCounts(){
+  const band=curBand();const bIn=new Array(NB).fill(0),eIn=new Array(NB).fill(0),eTot=new Array(NB).fill(0);let inb=0,health=0;
+  for(let i=0;i<N;i++){const m=M[i],ok=m>=band.low&&m<=band.high,b=BEN[i];if(ok){inb++;bIn[b]++;}if(EDGE[i]){eTot[b]++;if(ok)eIn[b]++;}
+    health+=(DRY[i]>=1||ROT[i]>=1)?0:(1-Math.max(DRY[i],ROT[i])*.8)*(1-Math.min(BURN[i],1)*.4)*(1-Math.min(STR[i],1)*.3);}
+  let bOk=0,eOk=0;for(let b=0;b<NB;b++){if(bIn[b]/PER>=.85)bOk++;if(eIn[b]/eTot[b]>=.85)eOk++;}
+  return{bOk,eOk,wp:Math.round(inb/N*100),hp:Math.round(health/N*100)};
+}
+
+/* ================= 画面：スタート ================= */
+function drawStart(x,p){
+  frame(x,1600,1000);
+  txt(x,'🌱 育苗ハウス 1号棟 VR',80,128,{size:66,w:800});
+  txt(x,'20日間、プラグ苗の水分を守って出荷まで育てよう。',84,188,{size:32,w:700,c:COL.soft});
+  const rules=[
+    xrOn?'右手のノズルでベンチの土を狙い、トリガーで水をかけます。水は放物線を描いて飛び、着地点の輪に入ります。':'ベンチの土を左ドラッグでなぞって水をかけます。着地点の輪の中に水が入ります。',
+    'ノズルは 💦ビッグ／🚿フラット／💧ストレート。広いノズルは境界で隣のベンチににじむので、端はストレートで仕上げます。',
+    'さっと撫でるだけでは水はほとんど入りません。少し留めるように撒くのがコツ。',
+    `多すぎても少なすぎてもダメ。${PHASE2_DAY}日目から本葉期になり、適正の幅が狭くなります。`,
+    '1日は 8:00〜17:00（30秒で1時間）。12時台は昼休憩で自動的に進みます。'];
+  let y=262;
+  rules.forEach(r=>{x.fillStyle=COL.leaf;x.beginPath();x.arc(98,y-11,9,0,Math.PI*2);x.fill();y=para(x,r,124,y,660,29,42,{w:700})+16;});
+  const R=860;
+  x.fillStyle=COL.panel2;rr(x,R-24,222,720,580,32);x.fill();
+  txt(x,xrOn?'🎮 コントローラー':'⌨️ PCプレビューの操作',R,280,{size:36,w:800});
+  const rows=xrOn?[['右トリガー','散水／パネルを指しているときは決定'],['右スティック','左右に倒して30°ずつ向きを変える'],['左スティック','歩いて移動（実際に歩いてもOK）'],
+      ['A','ノズル切替'],['B','水分ビュー'],['X','時間の速さ ▷→→→'],['Y','設定を開く／閉じる'],['左手首','時刻・状態のパネル（右手で押せます）']]
+    :[['左ドラッグ','散水'],['右ドラッグ・矢印','視点'],['W A S D','移動'],['1 2 3・ホイール','ノズル切替'],['V','水分ビュー'],['F','時間の速さ'],['E','設定を開く／閉じる'],['左下のパネル','時刻・状態（クリックで操作）']];
+  y=340;rows.forEach(([k,v])=>{txt(x,k,R,y,{size:28,w:800,c:COL.waterD});txt(x,v,R+230,y,{size:27,w:700,max:440});y+=58;});
+  p.button('start',560,848,480,104,'育苗をはじめる',startGame,{primary:true,size:44});
+}
+function startGame(){hideModal();S.running=true;startDay();}
+
+/* ================= 画面：設定 ================= */
+let restartSure=false;
+function drawMenu(x,p){
+  frame(x,1600,1000);
+  const c=todoCounts(),band=curBand(),wx=WX[S.weather[S.day]];
+  txt(x,`${S.day}日目　${dateStr()}`,70,108,{size:56,w:800});
+  txt(x,`${clockStr(S.clock)} ${segAt(S.clock).label}｜${band.name}：適正水分 ${pct(band.low)}〜${pct(band.high)}%｜設定中は時間が止まります`,72,158,{size:27,w:700,c:COL.soft,max:1140});
+  p.button('close',1250,56,290,92,'閉じて再開',closeMenu,{primary:true,size:36});
+  /* 左列 */
+  const L=70,LW=700;let y=232;
+  txt(x,'📋 やること',L,y,{size:34,w:800});y+=18;
+  [['ベンチを適正水分に',c.bOk,NB],['温度を確認する',S.checkedTemp?1:0,1],['ベンチの端を仕上げる',c.eOk,NB]].forEach(([t,v,m])=>{
+    const done=v>=m;x.fillStyle=done?'#e3f3d6':COL.panel2;rr(x,L,y,LW,54,18);x.fill();
+    x.fillStyle=done?COL.leaf:'#fff';x.beginPath();x.arc(L+32,y+27,15,0,Math.PI*2);x.fill();x.lineWidth=3;x.strokeStyle=done?COL.leafD:COL.edge;x.stroke();
+    if(done)txt(x,'✓',L+32,y+29,{size:22,w:800,c:'#fff',a:'center',b:'middle'});
+    txt(x,t,L+64,y+37,{size:28,w:700});txt(x,`${v}/${m}`,L+LW-22,y+37,{size:28,w:800,a:'right'});y+=62;});
+  y+=36;txt(x,'🌡️ 環境管理',L,y,{size:34,w:800});
+  let peak=0;for(let h=8;h<=17;h+=.5)peak=Math.max(peak,tempAt(h));
+  y+=42;txt(x,`今 ${tempAt(S.clock/60).toFixed(1)}℃　予想最高 ${peak.toFixed(1)}℃　${wx.icon} ${wx.name}`,L,y,{size:27,w:700,c:COL.soft,max:LW});
+  y+=48;txt(x,'遮光カーテン（閉める時間帯）',L,y,{size:29,w:800});
+  y=para(x,'閉めている間は乾きが最小になり葉焼けも防げる。光が減るぶん生育はやや遅れ、徒長しやすい。',L,y+34,LW,23,31,{w:700,c:COL.soft});
+  const bx=m=>L+LW*(m-DAY_START)/(DAY_END-DAY_START);
+  x.fillStyle='#efe4c8';rr(x,L,y,LW,24,12);x.fill();
+  if(S.shadeTo>S.shadeFrom){x.fillStyle='rgba(90,69,53,.55)';rr(x,bx(S.shadeFrom),y,bx(S.shadeTo)-bx(S.shadeFrom),24,12);x.fill();}
+  [8,10,12,14,16,17].forEach(h=>txt(x,h,bx(h*60),y+50,{size:20,w:700,c:COL.soft,a:'center'}));
+  y+=66;
+  const sh=(k,d)=>()=>{if(k==='from')S.shadeFrom=clamp(S.shadeFrom+d,DAY_START,S.shadeTo);else S.shadeTo=clamp(S.shadeTo+d,S.shadeFrom,DAY_END);modal.redraw();wrist.redraw();};
+  p.button('sf-',L,y,70,58,'−',sh('from',-30),{size:34});txt(x,clockStr(S.shadeFrom),L+128,y+42,{size:32,w:800,a:'center'});p.button('sf+',L+186,y,70,58,'＋',sh('from',30),{size:34});
+  txt(x,'〜',L+292,y+42,{size:30,w:800,a:'center'});
+  p.button('st-',L+326,y,70,58,'−',sh('to',-30),{size:34});txt(x,clockStr(S.shadeTo),L+454,y+42,{size:32,w:800,a:'center'});p.button('st+',L+512,y,70,58,'＋',sh('to',30),{size:34});
+  if(!(S.shadeTo>S.shadeFrom))txt(x,'使わない',L+600,y+40,{size:22,w:700,c:COL.soft});
+  y+=92;
+  const envSet=(k,v)=>{S[k]=v;modal.redraw();wrist.redraw();};
+  txt(x,'換気ファン',L,y+26,{size:29,w:800});txt(x,'蒸れ・過湿の害を軽く',L,y+58,{size:22,w:700,c:COL.soft});
+  p.seg('vent',L+LW-300,y,300,62,[[false,'停止'],[true,'運転']],S.vent,v=>envSet('vent',v));
+  y+=86;
+  txt(x,'天窓',L,y+26,{size:29,w:800});
+  txt(x,S.wateredToday?'今日はもう潅水したので変更不可':'開：乾き×1.25／閉：×0.82',L,y+58,{size:22,w:700,c:S.wateredToday?COL.warn:COL.soft});
+  p.seg('sky',L+LW-300,y,300,62,[[true,'開'],[false,'閉']],S.skyOpen,v=>envSet('skyOpen',v),S.wateredToday);
+  /* 右列 */
+  const R=850,RW=680;y=232;
+  txt(x,'🚿 ノズルの水量',R,y,{size:34,w:800});y+=24;
+  TOOL_ORDER.forEach(k=>{const t=TOOLS[k],st=k==='straight'?1:5;
+    x.fillStyle=COL.panel2;rr(x,R,y,RW,92,22);x.fill();
+    txt(x,`${t.ico} ${t.name}`,R+22,y+44,{size:30,w:800});txt(x,`中心で ${(toolRate(k)*100).toFixed(1)}/秒`,R+22,y+76,{size:21,w:700,c:COL.soft});
+    const lp=d=>()=>{LPM[k]=clamp(LPM[k]+d,t.min,t.max);try{localStorage.setItem('ikubyo_lpm',JSON.stringify(LPM));}catch(e){}modal.redraw();wrist.redraw();};
+    p.button('l-'+k,R+330,y+16,68,60,'−',lp(-st),{size:34,dis:LPM[k]<=t.min});
+    txt(x,`${LPM[k]} L/min`,R+500,y+56,{size:30,w:800,a:'center'});
+    p.button('l+'+k,R+594,y+16,68,60,'＋',lp(st),{size:34,dis:LPM[k]>=t.max});
+    y+=104;});
+  y=para(x,'範囲が狭いノズルほど、同じ水量でも1点に濃く出ます。カラカラの土は最初の3秒しみ込みにくくなります。',R,y+20,RW,22,30,{w:700,c:COL.soft});
+  y+=24;txt(x,'🎮 表示・時間',R,y,{size:34,w:800});y+=22;
+  txt(x,'水分ビュー',R,y+42,{size:28,w:800});
+  p.seg('view',R+RW-320,y,320,62,[[false,'通常'],[true,'水分']],S.view,v=>{if(v!==S.view)toggleView();});
+  y+=80;txt(x,'時間の速さ',R,y+42,{size:28,w:800});
+  p.seg('spd',R+RW-420,y,420,62,SPEEDS.map((s,i)=>[i,`${s.sym} ×${s.m}`]),S.spd,v=>setSpeed(v));
+  y+=96;
+  p.button('restart',R,Math.max(y,872),RW,74,restartSure?'本当にやり直す？（もう一度押す）':'最初からやり直す',()=>{
+    if(restartSure){restartSure=false;closeMenu();restartGame();}else{restartSure=true;modal.redraw();}},{size:28});
+}
+function openMenu(){if(!S.running||S.paused&&!S.menuOpen)return;S.menuOpen=true;S.paused=true;S.checkedTemp=true;restartSure=false;showModal('menu',drawMenu);wrist.redraw();}
+function closeMenu(){S.menuOpen=false;S.paused=false;hideModal();wrist.redraw();}
+function resetPlayer(){
+  if(xrOn){camera.getWorldPosition(headW);rig.position.x+=-7-headW.x;rig.position.z+=0-headW.z;}
+  else{pos.set(-7,0,0);yaw=-Math.PI/2;pitch=-.35;}
+}
+function restartGame(){resetGame();resetPlayer();setTool('flat');applyViewMode();S.running=true;startDay();}
+
+/* ================= 進行 ================= */
+function startDay(){
+  S.clock=DAY_START;S.wateredToday=false;S.paused=false;setSpeed(0);applyViewMode();
+  toast(`☀️ ${S.day}日目 8:00　朝の潅水から`);wrist.redraw();
+}
+const MARKS=[720,780,960,DAY_END];
+function advanceClock(realDt){
+  const g=segAt(S.clock);let mult=SPEEDS[S.spd].m;if(g.kind==='lunch')mult=Math.max(mult,LUNCH_MIN_SPEED);
+  let to=S.clock+realDt*GMIN_PER_SEC*mult;
+  const mk=MARKS.find(m=>S.clock<m&&to>=m);if(mk!==undefined)to=mk;
+  simulate(to-S.clock,S.clock);S.clock=to;
+  if(mk===720)toast('🍱 昼休憩：12〜13時は自動で進みます（潅水不可）');
+  if(mk===780)setSpeed(0,'☀️ 13:00 昼の潅水。等倍に戻しました');
+  if(mk===960)toast('🌇 16:00 夕方の潅水。端の仕上げどき');
+  if(mk===DAY_END)endDay();
+}
+function dayStats(){
+  let ib=0,alive=0,wilt=0,over=0,edgeDry=0,innerDry=0,eT=0,iT=0;
+  for(let i=0;i<N;i++){if(DRY[i]<1&&ROT[i]<1){alive++;ib+=IB[i];}wilt+=WLT[i];over+=OVR[i];
+    if(EDGE[i]){eT++;edgeDry+=DRYT[i];}else{iT++;innerDry+=DRYT[i];}}
+  return{ib:Math.round(alive&&S.dayMin?ib/alive/S.dayMin*100:0),wilt,over,maxT:Math.round(S.maxT),edgeR:edgeDry/eT,innerR:innerDry/iT,hot:S.hotNoShade};
+}
+function endDay(){
+  S.paused=true;const st=dayStats();S.history.push(st.ib);
+  if(S.day>=DAYS){showResults();return;}
+  showModal('night',(x)=>{frame(x,1600,1000);txt(x,'🌙 夜間',800,450,{size:80,w:800,a:'center'});
+    txt(x,'17:00〜翌8:00　含水量が一定量だけ下がります',800,540,{size:34,w:700,c:COL.soft,a:'center'});});
+  const nd=NIGHT_DECAY[phaseIdx()]/100;
+  setTimeout(()=>{for(let i=0;i<N;i++)if(DRY[i]<1&&ROT[i]<1)M[i]=Math.max(0,M[i]-nd);showDayModal(st);},1100);
+}
+function noteBox(x,y,kind,s){
+  const ls=lines(x,s,1380,27,700);const h=ls.length*36+26;
+  x.fillStyle=kind==='bad'?'#fde6df':kind==='good'?'#e3f3d6':kind==='phase'?'#e1f1fb':COL.panel2;rr(x,70,y,1460,h,22);x.fill();
+  if(kind==='bad'||kind==='good'||kind==='phase'){x.fillStyle=kind==='bad'?COL.warn:kind==='good'?COL.leaf:COL.water;rr(x,70,y,12,h,6);x.fill();}
+  x.fillStyle=COL.ink;x.textAlign='left';x.textBaseline='alphabetic';setFont(x,27,700);ls.forEach((l,i)=>x.fillText(l,104,y+40+i*36));
+  return y+h+10;
+}
+function showDayModal(st){
+  const d=S.day,tw=WX[S.weather[d+1]],p2=d>=PHASE2_DAY;const notes=[];
+  if(st.edgeR>st.innerR*1.4&&st.edgeR>.2)notes.push(['bad','ベンチの端が先に乾いています。ストレートで境界を仕上げましょう。']);
+  if(st.wilt>0)notes.push(['bad',`萎れかけたセルが ${st.wilt} 個。水を戻しても、ダメージは内部に残ります。`]);
+  if(st.over>N*.15)notes.push(['bad',p2?'過湿のセルが多めです。本葉期の過湿は徒長の原因になります。':'水たまりが目立ちます。発芽期の過湿は腐敗リスクにつながります。']);
+  if(st.hot>30)notes.push(['bad',`日中 30℃ を超えた時間が約 ${Math.round(st.hot)} 分。遮光カーテンの時間帯を見直しましょう。`]);
+  if(!notes.length)notes.push(['good','安定した管理です。この調子で。']);
+  if(d+1===PHASE2_DAY)notes.push(['phase',`🌿 明日から本葉期。葉が増えて蒸散量が上がるため、すぐ乾きます。適正水分は ${pct(BANDS[1].low)}〜${pct(BANDS[1].high)}% に狭まり、水の残しすぎは徒長につながります。`]);
+  notes.push(['info',`明日の天気：${tw.icon} ${tw.name}${tw.f>=1?'　日射が強く、乾きやすい日です':tw.f<.5?'　乾きにくい日。水の与えすぎに注意':''}`]);
+  const next=()=>{hideModal();S.day++;IB.fill(0);WLT.fill(0);OVR.fill(0);DRYT.fill(0);
+    S.dayMin=0;S.maxT=0;S.hotNoShade=0;S.checkedTemp=false;startDay();
+    if(S.day===PHASE2_DAY)toast('🌿 本葉が展開！ 適正水分の幅が狭くなりました');};
+  showModal('day',(x,p)=>{frame(x,1600,1000);
+    txt(x,`${d}日目 おつかれさま`,70,112,{size:58,w:800});
+    txt(x,`${dateStr()}　${curBand().name}`,74,164,{size:30,w:700,c:COL.soft});
+    [['適正水分の維持率',st.ib+'%'],['最高気温',st.maxT+'℃'],['萎れかけたセル',st.wilt],['過湿になったセル',st.over]].forEach(([l,v],i)=>{
+      const bx=70+i*372;x.fillStyle=COL.panel2;rr(x,bx,196,348,116,26);x.fill();
+      txt(x,l,bx+24,236,{size:25,w:800,c:COL.soft});txt(x,v,bx+324,294,{size:52,w:800,a:'right'});});
+    let y=336;notes.forEach(n=>{y=noteBox(x,y,n[0],n[1]);});
+    p.button('next',560,Math.max(870,y+12),480,100,`${d+1}日目へ ▶`,next,{primary:true,size:42});});
+}
+function showResults(){
+  let dead=0,late=0,str=0,burn=0,A=0;
+  for(let i=0;i<N;i++){if(DRY[i]>=1||ROT[i]>=1)dead++;else if(G[i]<.85)late++;else if(STR[i]>.6)str++;else if(BURN[i]>.5)burn++;else A++;}
+  const score=Math.round((A+(str+burn)*.4)/N*100),ship=Math.round((N-dead-late)/N*100);
+  const rank=score>=90?'S':score>=75?'A':score>=55?'B':score>=35?'C':'D';
+  let best=0;try{best=+localStorage.getItem('ikubyo_vr_best')||0;if(score>best)localStorage.setItem('ikubyo_vr_best',score);}catch(e){}
+  const avg=Math.round(S.history.reduce((a,b)=>a+b,0)/S.history.length);
+  const again=()=>{hideModal();resetGame();resetPlayer();setTool('flat');updatePlants();S.running=true;startDay();};
+  showModal('results',(x,p)=>{frame(x,1600,1000);
+    txt(x,'出荷判定　20日間の管理結果',70,108,{size:56,w:800});
+    txt(x,'見た目には出なかった過去のストレスも、ここで結果に表れます。',74,160,{size:29,w:700,c:COL.soft});
+    x.fillStyle=COL.leaf;x.beginPath();x.arc(166,286,86,0,Math.PI*2);x.fill();
+    txt(x,rank,166,292,{size:110,w:800,c:'#fff',a:'center',b:'middle'});
+    txt(x,`スコア ${score} 点`,290,270,{size:54,w:800});
+    txt(x,`出荷可能率 ${ship}%　期間平均の適正維持率 ${avg}%${best?`　自己ベスト ${Math.max(best,score)} 点`:''}`,292,330,{size:29,w:700,c:COL.soft,max:1230});
+    const parts=[[A,'#7cc45f','A品'],[str,'#c9e07a','徒長（クレーム）'],[burn,'#d9a35b','葉焼け'],[late,'#8fb8d6','生育遅延'],[dead,'#b3907a','出荷不可']];
+    let bx=70;x.save();rr(x,70,400,1460,56,28);x.clip();parts.forEach(([n,c])=>{const w=1460*n/N;x.fillStyle=c;x.fillRect(bx,400,w,56);bx+=w;});x.restore();
+    let lx=70;parts.forEach(([n,c,l])=>{x.fillStyle=c;rr(x,lx,488,26,26,6);x.fill();const s=`${l} ${n}`;txt(x,s,lx+36,510,{size:26,w:800});setFont(x,26,800);lx+=x.measureText(s).width+70;});
+    txt(x,'日ごとの適正水分の維持率',70,584,{size:28,w:800});
+    const hw=1460/DAYS;S.history.forEach((v,i)=>{const h=Math.max(4,v)*2;x.fillStyle=i+1>=PHASE2_DAY?'#4fb3e8':'#7cc45f';rr(x,70+i*hw+6,812-h,hw-12,h,8);x.fill();});
+    x.fillStyle=COL.edge;x.fillRect(70,814,1460,3);
+    p.button('again',560,862,480,100,'もう一度育てる',again,{primary:true,size:42});});
+}
+
+/* ================= 入力：PCプレビュー ================= */
+const keys={};
+let hasMouse=false,looking=false,pressing=false,lx=0,ly=0,yaw=-Math.PI/2,pitch=-.35,xrOn=false,xrSession=null;
+const pos=V3(-7,0,0);
+const cv=renderer.domElement;
+function setMouse(e){mouse.set(e.clientX/innerWidth*2-1,-(e.clientY/innerHeight)*2+1);hasMouse=true;}
+function uiMouse(){
+  camera.updateMatrixWorld();ray.setFromCamera(mouse,camera);
+  const hs=ray.intersectObjects(uiList(),false);if(!hs.length)return null;
+  const h=hs[0],p=h.object.userData.panel;return{panel:p,btn:h.uv?p.at(h.uv):null,point:h.point,distance:h.distance};
+}
+cv.addEventListener('contextmenu',e=>e.preventDefault());
+cv.addEventListener('pointerdown',e=>{
+  if(xrOn)return;cv.setPointerCapture(e.pointerId);setMouse(e);
+  if(e.button===2||e.button===1||e.shiftKey){looking=true;lx=e.clientX;ly=e.clientY;return;}
+  const u=uiMouse();if(u){if(u.btn)u.btn.fn();return;}
+  pressing=true;
+});
+cv.addEventListener('pointermove',e=>{
+  if(xrOn)return;
+  if(looking){yaw-=(e.clientX-lx)*.004;pitch=clamp(pitch-(e.clientY-ly)*.004,-1.3,.35);lx=e.clientX;ly=e.clientY;}
+  setMouse(e);
+});
+const ptrUp=()=>{looking=false;pressing=false;};
+cv.addEventListener('pointerup',ptrUp);cv.addEventListener('pointercancel',ptrUp);
+cv.addEventListener('pointerleave',()=>{if(!pressing&&!looking)hasMouse=false;});
+cv.addEventListener('wheel',e=>{e.preventDefault();if(!xrOn)toggleTool();},{passive:false});
+addEventListener('keydown',e=>{
+  if(xrOn)return;
+  if(e.code==='Enter'&&modal.mesh.visible&&modal.primaryFn){modal.primaryFn();return;}
+  if(modal.mesh.visible&&!S.menuOpen)return;
+  keys[e.code]=true;
+  if(e.code==='Digit1')setTool('big');
+  if(e.code==='Digit2')setTool('flat');
+  if(e.code==='Digit3')setTool('straight');
+  if(e.code==='KeyV')toggleView();
+  if(e.code==='KeyE'||e.code==='Escape'){S.menuOpen?closeMenu():e.code==='KeyE'&&openMenu();}
+  if(e.code==='KeyF')cycleSpeed();
+  if(e.code.startsWith('Arrow'))e.preventDefault();
+});
+addEventListener('keyup',e=>{keys[e.code]=false;});
+addEventListener('blur',()=>{for(const k in keys)keys[k]=false;pressing=false;looking=false;});
+const dz=v=>Math.abs(v)<.15?0:v;
+function walkable(x,z){if(Math.abs(x)>7.7||Math.abs(z)>3.2)return false;return Math.abs(z)<=.5||Math.abs(x)>=6.85;}
+function updateMoveDesk(dt){
+  const f=(keys.KeyW?1:0)-(keys.KeyS?1:0),s=(keys.KeyD?1:0)-(keys.KeyA?1:0);
+  const turn=(keys.ArrowLeft?1:0)-(keys.ArrowRight?1:0),tilt=(keys.ArrowUp?1:0)-(keys.ArrowDown?1:0);
+  yaw+=turn*1.6*dt;pitch=clamp(pitch+tilt*1.1*dt,-1.3,.35);
+  const sp=2.6*dt,fx=-Math.sin(yaw),fz=-Math.cos(yaw),rx=Math.cos(yaw),rz=-Math.sin(yaw);
+  const dx=(fx*f+rx*s)*sp,dzz=(fz*f+rz*s)*sp;
+  if(walkable(pos.x+dx,pos.z))pos.x+=dx;if(walkable(pos.x,pos.z+dzz))pos.z+=dzz;
+  const moving=Math.abs(f)+Math.abs(s)>.05;
+  rig.position.set(pos.x,0,pos.z);rig.rotation.set(0,0,0);
+  camera.position.set(0,EYE+Math.sin(performance.now()/260)*(moving?.012:0),0);
+  camera.rotation.set(pitch,yaw,0);
+}
+const qA=new THREE.Quaternion(),aimV=new THREE.Vector3();
+function aimDesk(hit,spraying){
+  camera.updateMatrixWorld();qA.copy(deskHolder.quaternion);
+  if(hit&&hit.ok)deskHolder.lookAt(hit.pt);
+  else{camera.getWorldDirection(aimV);camera.getWorldPosition(tmpV);aimV.multiplyScalar(3).add(tmpV);aimV.y-=.8;deskHolder.lookAt(aimV);}
+  const qB=deskHolder.quaternion.clone();deskHolder.quaternion.copy(qA).slerp(qB,.25);
+  deskHolder.position.set(.24+(spraying?rand(-.002,.002):0),-.27+(spraying?rand(-.002,.002):0),-.32);
+}
+
+/* ================= 入力：VR（Meta Quest コントローラー） ================= */
+const uiList=()=>[modal.mesh,wrist.mesh].filter(m=>m.visible&&m.parent);
+const ctrls=[0,1].map(i=>{
+  const r=renderer.xr.getController(i),g=renderer.xr.getControllerGrip(i);rig.add(r);rig.add(g);
+  const o={ray:r,grip:g,hand:null,src:null,prev:{},snapReady:true,trigLock:false};
+  r.addEventListener('connected',e=>{o.src=e.data;o.hand=e.data.handedness;mountHands();});
+  r.addEventListener('disconnected',()=>{o.src=null;o.hand=null;o.prev={};mountHands();});
+  return o;});
+const hasPad=o=>o.src&&o.src.gamepad;
+const rightC=()=>ctrls.find(o=>o.hand==='right'&&hasPad(o));
+const leftC=()=>ctrls.find(o=>o.hand==='left'&&hasPad(o));
+const held=(o,k)=>{const b=o.src.gamepad.buttons[k];return!!(b&&b.pressed);};
+function edge(o,k){const now=held(o,k),was=!!o.prev[k];o.prev[k]=now;return now&&!was;}
+function stick(o){const a=o.src.gamepad.axes;return a.length>=4?[a[2],a[3]]:[a[0]||0,a[1]||0];}
+function haptic(o,v,ms){const h=o&&hasPad(o)&&o.src.gamepad.hapticActuators;if(h&&h[0]&&h[0].pulse){try{h[0].pulse(v,ms);}catch(e){}}}
+function mountHands(){
+  if(!xrOn){deskInner.add(nozzle);camera.add(wrist.mesh);wrist.mesh.position.set(-.25,-.19,-.48);wrist.mesh.rotation.set(0,0,0);wrist.mesh.visible=true;if(laser.parent)laser.parent.remove(laser);return;}
+  const r=rightC(),l=leftC();
+  if(r){r.grip.add(nozzle);r.ray.add(laser);}
+  if(l){l.grip.add(wrist.mesh);wrist.mesh.position.set(0,.07,.06);wrist.mesh.rotation.set(-1.05,0,0);wrist.mesh.visible=true;l.grip.add(leftBody);}
+  else wrist.mesh.visible=false;
+  nozzle.position.set(0,0,0);nozzle.rotation.set(0,0,0);
+}
+function moveXR(ax,ay,dt){
+  if(!ax&&!ay)return;
+  camera.getWorldPosition(headW);camera.getWorldDirection(fwd);fwd.y=0;if(fwd.lengthSq()<1e-4)return;fwd.normalize();
+  const sp=2*dt,dx=(fwd.x*-ay+-fwd.z*ax)*sp,dzz=(fwd.z*-ay+fwd.x*ax)*sp;
+  let hx=headW.x,hz=headW.z;
+  if(walkable(hx+dx,hz)||!walkable(hx,hz)){rig.position.x+=dx;hx+=dx;}
+  if(walkable(hx,hz+dzz)||!walkable(hx,hz)){rig.position.z+=dzz;}
+}
+function snapTurn(a){camera.getWorldPosition(headW);rig.position.sub(headW).applyAxisAngle(V3(0,1,0),a).add(headW);rig.rotation.y+=a;}
+function menuButton(){if(S.menuOpen)closeMenu();else if(modalMode)placeModal();else openMenu();}
+function pollXR(dt){
+  const r=rightC(),l=leftC();
+  if(l){const[ax,ay]=stick(l);moveXR(dz(ax),dz(ay),dt);if(edge(l,4))cycleSpeed();if(edge(l,5))menuButton();}
+  if(r){const[ax]=stick(r);
+    if(Math.abs(ax)>.7&&r.snapReady){snapTurn(ax>0?-Math.PI/6:Math.PI/6);r.snapReady=false;}
+    if(Math.abs(ax)<.3)r.snapReady=true;
+    if(edge(r,4))toggleTool();if(edge(r,5))toggleView();}
+}
+function uiFromController(o){
+  o.ray.updateMatrixWorld(true);tmpV.setFromMatrixPosition(o.ray.matrixWorld);
+  dirW.set(0,0,-1).transformDirection(o.ray.matrixWorld);
+  ray.set(tmpV,dirW);ray.far=4;const hs=ray.intersectObjects(uiList(),false);ray.far=Infinity;
+  if(!hs.length)return null;const h=hs[0],p=h.object.userData.panel;
+  return{panel:p,btn:h.uv?p.at(h.uv):null,point:h.point,distance:h.distance,obj:h.object};
+}
+
+/* ================= VRセッション ================= */
+function setShadows(on){renderer.shadowMap.enabled=on;sun.castShadow=on;
+  scene.traverse(o=>{const m=o.material;if(!m)return;(Array.isArray(m)?m:[m]).forEach(q=>q.needsUpdate=true);});}
+async function startXR(){
+  try{
+    const s=await navigator.xr.requestSession('immersive-vr',{optionalFeatures:['local-floor','bounded-floor']});
+    xrSession=s;s.addEventListener('end',onXREnd);
+    await renderer.xr.setSession(s);
+    xrOn=true;setShadows(false);                     // Quest向けに影を切って72〜90fpsを確保
+    rig.position.set(pos.x,0,pos.z);rig.rotation.set(0,yaw,0);camera.position.set(0,0,0);camera.rotation.set(0,0,0);
+    pressing=false;looking=false;mountHands();needPlace=3;
+    if(modalMode==='start')modal.redraw();
+    $('#vrBtn').textContent='VRを終了';
+  }catch(e){$('#gateMsg').textContent='VRを開始できませんでした（'+(e&&e.message||e)+'）。';}
+}
+function onXREnd(){
+  camera.getWorldPosition(headW);camera.getWorldDirection(fwd);
+  xrOn=false;xrSession=null;
+  pos.set(headW.x,0,headW.z);if(!walkable(pos.x,pos.z))pos.set(-7,0,0);
+  yaw=Math.atan2(-fwd.x,-fwd.z);pitch=-.35;
+  laser.visible=cursor.visible=arcLine.visible=false;
+  setShadows(true);mountHands();onResize();if(modal.mesh.visible)placeModal();
+  $('#vrBtn').textContent='🥽 VRで遊ぶ';
+}
+async function initXR(){
+  const b=$('#vrBtn'),m=$('#gateMsg');
+  if(!navigator.xr){m.textContent='このブラウザはVR（WebXR）に対応していません。Meta Quest のブラウザで開くとVRで遊べます。PCではこのままプレビューできます。';return;}
+  let ok=false;try{ok=await navigator.xr.isSessionSupported('immersive-vr');}catch(e){ok=false;}
+  if(!ok){const framed=(()=>{try{return window.self!==window.top;}catch(e){return true;}})();
+    if(framed&&navigator.xr){m.textContent='埋め込み表示の中ではVRが許可されていない可能性があります。このHTMLを https のページ（GitHub Pages など）に置いて、Quest のブラウザで直接開いてください。PCではこのままプレビューできます。';return;}
+    m.textContent='この表示環境ではVRを起動できません。Quest のブラウザで、このHTMLを https のページ（GitHub Pages など）に置いて開いてください。PCではこのままプレビューできます。';return;}
+  b.disabled=false;m.textContent='Quest のブラウザでボタンを押すと、ハウスの中に実寸で立てます。';
+  b.onclick=()=>{if(xrSession)xrSession.end();else startXR();};
+}
+initXR();
+
+/* ================= ループ ================= */
+let last=0,frameN=0,hudT=0,idleT=0,hapT=0;
+function setHover(panel,key){for(const p of[modal,wrist]){const k=p===panel?key:null;if(p.hover!==k){p.hover=k;p.redraw();}}}
+function loop(now){
+  const dt=last?Math.min(.05,(now-last)/1000):.016;last=now;frameN++;
+  const pnow=performance.now();
+  if(needPlace>0&&--needPlace===0&&modal.mesh.visible)placeModal();
+  let hit=null,ui=null,wantSpray=false;
+  if(xrOn){
+    rig.updateMatrixWorld(true);
+    pollXR(dt);rig.updateMatrixWorld(true);
+    const r=rightC();
+    if(r){
+      ui=uiFromController(r);
+      const trig=edge(r,0),hold=held(r,0);
+      if(!hold)r.trigLock=false;
+      if(ui){laser.visible=true;laser.scale.z=ui.distance;
+        if(trig&&ui.btn){r.trigLock=true;haptic(r,.35,25);ui.btn.fn();}}
+      else{laser.visible=false;hit=S.running?pickVR():null;wantSpray=hold&&!r.trigLock;}
+    }else laser.visible=false;
+  }else{
+    if(!S.running){idleT+=dt;yaw=-Math.PI/2+Math.sin(idleT*.15)*.35;}
+    updateMoveDesk(dt);scene.updateMatrixWorld();
+    if(hasMouse&&!looking)ui=uiMouse();
+    if(!ui&&S.running)hit=pickDesk();
+    wantSpray=pressing&&!ui;
+  }
+  setHover(ui&&ui.btn?ui.panel:null,ui&&ui.btn?ui.btn.key:null);
+  if(xrOn&&ui){cursor.visible=true;cursor.position.copy(ui.point);ui.obj.getWorldQuaternion(cursor.quaternion);
+    tmpV.set(0,0,1).applyQuaternion(cursor.quaternion);cursor.position.addScaledVector(tmpV,.003);}
+  else cursor.visible=false;
+
+  const g=segAt(S.clock);
+  const canWater=S.running&&!S.paused&&g.kind!=='lunch'&&S.spd===0;
+  const wants=wantSpray&&S.running&&!S.paused&&hit&&hit.ok;
+  const spraying=!!(wants&&canWater);
+  if(spraying){applyWater(hit.pt,dt);emit(hit,dt);S.wateredToday=true;
+    if(xrOn){hapT-=dt;if(hapT<=0){hapT=.07;haptic(rightC(),S.tool==='straight'?.07:S.tool==='big'?.2:.13,80);}}}
+  else stopWater();
+  if(wants&&!canWater&&pnow-S.warnT>2500){S.warnT=pnow;toast(g.kind==='lunch'?'🍱 昼休憩中は潅水できません':'⏩ 早送り中は潅水できません（▷で等倍に）');}
+  if(!xrOn)aimDesk(hit,spraying);
+  updateDrops(dt);
+  if(S.running&&!S.paused)advanceClock(dt);
+  if(hit){ring.visible=ringDot.visible=true;ring.position.set(hit.pt.x,SOIL_TOP+.012,hit.pt.z);ringDot.position.copy(ring.position);
+    ring.material.color.set(!hit.ok||!canWater?0xb0b0b0:hit.spill?0xffa35c:TOOLS[S.tool].color);ring.material.opacity=hit.ok?.9:.4;}
+  else ring.visible=ringDot.visible=false;
+  arcLine.visible=!!(xrOn&&hit&&!spraying&&!S.paused);
+  if(arcLine.visible)arcLine.material.color.set(hit.ok&&canWater?TOOLS[S.tool].color:0xb0b0b0);
+  updateSoil();if(frameN%3===0)updatePlants();
+  updateWorld(dt);
+  hudT+=dt;if(hudT>.25){hudT=0;wrist.redraw();}
+  updateGauge(hit);
+  if(toastP.mesh.visible&&pnow>toastUntil)toastP.mesh.visible=false;
+  renderer.render(scene,camera);
+}
+function onResize(){if(renderer.xr.isPresenting)return;camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight);if(modal.mesh.visible)placeModal();}
+addEventListener('resize',onResize);
+
+/* ================= 起動 ================= */
+mountHands();setTool('flat');applyViewMode();updatePlants();wrist.redraw();
+showModal('start',drawStart);
+renderer.setAnimationLoop(loop);
+})();
+</script>
+</body>
+</html>
